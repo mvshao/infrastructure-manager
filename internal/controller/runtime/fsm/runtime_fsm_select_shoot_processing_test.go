@@ -33,6 +33,88 @@ var _ = Describe("KIM sFnSelectShootProcessing", func() {
 	inputRtWithForceAnnotation := makeInputRuntimeWithAnnotation(map[string]string{"operator.kyma-project.io/force-patch-reconciliation": "true"})
 	inputRtWithSuspendAnnotation := makeInputRuntimeWithAnnotation(map[string]string{"operator.kyma-project.io/suspend-patch-reconciliation": "true"})
 
+	// Issue #9471 fixtures: Runtimes whose cached Status.State is Ready or Failed
+	// (so they pass through the existing Pending/"" guard at line 44) and whose
+	// applied-generation annotation matches Runtime.Generation (so shouldPatchShoot
+	// returns false). These reach the new Shoot-side check.
+	inputRtReady := makeInputRuntimeWithAnnotation(nil)
+	inputRtReady.Status.State = imv1.RuntimeStateReady
+	inputRtFailed := makeInputRuntimeWithAnnotation(nil)
+	inputRtFailed.Status.State = imv1.RuntimeStateFailed
+
+	// shoot-runtime-generation annotation matching the runtime's generation makes
+	// shouldPatchShoot return false. Runtime.Generation defaults to 0 for these
+	// fixtures, so "0" matches.
+	shootRuntimeGenerationAnnotation := map[string]string{
+		"infrastructuremanager.kyma-project.io/runtime-generation": "0",
+	}
+
+	// (a) Shoot indicates mid-reconcile via Generation > ObservedGeneration:
+	//     KIM patched the Shoot, Gardener accepted (Generation=2) but hasn't
+	//     observed it yet (ObservedGeneration=1). LastOperation may already be
+	//     Succeeded from a prior cycle.
+	testShootGenerationAhead := gardener.Shoot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-shoot",
+			Namespace:   "garden-",
+			Generation:  2,
+			Annotations: shootRuntimeGenerationAnnotation,
+		},
+		Spec: gardener.ShootSpec{
+			DNS: &gardener.DNS{Domain: ptr.To("test-domain")},
+		},
+		Status: gardener.ShootStatus{
+			ObservedGeneration: 1,
+			LastOperation: &gardener.LastOperation{
+				State: gardener.LastOperationStateSucceeded,
+				Type:  gardener.LastOperationTypeReconcile,
+			},
+		},
+	}
+
+	// (b) Shoot indicates mid-reconcile via LastOperation.State == Processing:
+	//     Generations agree (Gardener has observed) but it's still working.
+	testShootProcessing := gardener.Shoot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-shoot",
+			Namespace:   "garden-",
+			Generation:  1,
+			Annotations: shootRuntimeGenerationAnnotation,
+		},
+		Spec: gardener.ShootSpec{
+			DNS: &gardener.DNS{Domain: ptr.To("test-domain")},
+		},
+		Status: gardener.ShootStatus{
+			ObservedGeneration: 1,
+			LastOperation: &gardener.LastOperation{
+				State: gardener.LastOperationStateProcessing,
+				Type:  gardener.LastOperationTypeReconcile,
+			},
+		},
+	}
+
+	// (c)+(d) Steady-state quiet Shoot: Gardener has observed the spec
+	// (Generation == ObservedGeneration) and last operation is Succeeded.
+	// This is the no-storm path — we must still stop() here.
+	testShootQuiet := gardener.Shoot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-shoot",
+			Namespace:   "garden-",
+			Generation:  1,
+			Annotations: shootRuntimeGenerationAnnotation,
+		},
+		Spec: gardener.ShootSpec{
+			DNS: &gardener.DNS{Domain: ptr.To("test-domain")},
+		},
+		Status: gardener.ShootStatus{
+			ObservedGeneration: 1,
+			LastOperation: &gardener.LastOperation{
+				State: gardener.LastOperationStateSucceeded,
+				Type:  gardener.LastOperationTypeReconcile,
+			},
+		},
+	}
+
 	testShoot := gardener.Shoot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-shoot",
@@ -70,6 +152,46 @@ var _ = Describe("KIM sFnSelectShootProcessing", func() {
 			testCtx,
 			must(newFakeFSM, withTestFinalizer, withTestSchemeAndObjects()),
 			&systemState{instance: *inputRtWithSuspendAnnotation, shoot: &testShoot},
+			testOpts{
+				MatchExpectedErr: BeNil(),
+				MatchNextFnState: BeNil(),
+			},
+		),
+		Entry(
+			"issue 9471: cached Ready + Shoot Generation ahead of ObservedGeneration -> route to sFnWaitForShootReconcile",
+			testCtx,
+			must(newFakeFSM, withTestFinalizer, withTestSchemeAndObjects()),
+			&systemState{instance: *inputRtReady, shoot: &testShootGenerationAhead},
+			testOpts{
+				MatchExpectedErr: BeNil(),
+				MatchNextFnState: haveName("sFnWaitForShootReconcile"),
+			},
+		),
+		Entry(
+			"issue 9471: cached Ready + Shoot LastOperation Processing -> route to sFnWaitForShootReconcile",
+			testCtx,
+			must(newFakeFSM, withTestFinalizer, withTestSchemeAndObjects()),
+			&systemState{instance: *inputRtReady, shoot: &testShootProcessing},
+			testOpts{
+				MatchExpectedErr: BeNil(),
+				MatchNextFnState: haveName("sFnWaitForShootReconcile"),
+			},
+		),
+		Entry(
+			"issue 9471: cached Ready + Shoot quiet -> stop() (no-storm guard preserved)",
+			testCtx,
+			must(newFakeFSM, withTestFinalizer, withTestSchemeAndObjects()),
+			&systemState{instance: *inputRtReady, shoot: &testShootQuiet},
+			testOpts{
+				MatchExpectedErr: BeNil(),
+				MatchNextFnState: BeNil(),
+			},
+		),
+		Entry(
+			"issue 9471: cached Failed + Shoot quiet -> stop() (no-storm guard preserved)",
+			testCtx,
+			must(newFakeFSM, withTestFinalizer, withTestSchemeAndObjects()),
+			&systemState{instance: *inputRtFailed, shoot: &testShootQuiet},
 			testOpts{
 				MatchExpectedErr: BeNil(),
 				MatchNextFnState: BeNil(),
